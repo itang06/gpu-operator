@@ -23,6 +23,7 @@ import (
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -70,7 +71,7 @@ func NewClusterUpgradeStateManager(
 	k8sConfig *rest.Config,
 	eventRecorder record.EventRecorder,
 	opts StateOptions) (ClusterUpgradeStateManager, error) {
-	commonmanager, err := NewCommonUpgradeStateManager(log, k8sConfig, Scheme, eventRecorder)
+	commonmanager, err := newCommonUpgradeStateManager(log, k8sConfig, Scheme, eventRecorder, opts.Client)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create commonmanager upgrade state manager. %v", err)
 	}
@@ -96,6 +97,10 @@ func NewClusterUpgradeStateManager(
 
 type StateOptions struct {
 	Requestor RequestorOptions
+	// Client is a cached client used for all controller-runtime reads and writes.
+	// When nil, an uncached client is created from the REST config.
+	// Cache transforms need to preserve Node Spec.Unschedulable and the Ready condition.
+	Client client.Client
 }
 
 // BuildState builds a point-in-time snapshot of the driver upgrade state in the cluster.
@@ -125,9 +130,10 @@ func (m *ClusterUpgradeStateManagerImpl) BuildState(ctx context.Context, namespa
 		return nil, err
 	}
 
+	podsByOwner := m.GetPodsByDSOwner(daemonSets, podList.Items)
 	filteredPodList := []corev1.Pod{}
 	for _, ds := range daemonSets {
-		dsPods := m.GetPodsOwnedbyDs(ds, podList.Items)
+		dsPods := podsByOwner[ds.UID]
 		if int(ds.Status.DesiredNumberScheduled) != len(dsPods) {
 			m.Log.V(consts.LogLevelInfo).Info("Driver DaemonSet has Unscheduled pods", "name", ds.Name)
 			return nil, fmt.Errorf("driver DaemonSet should not have Unscheduled pods")
@@ -136,17 +142,16 @@ func (m *ClusterUpgradeStateManagerImpl) BuildState(ctx context.Context, namespa
 	}
 
 	// Collect also orphaned driver pods
-	filteredPodList = append(filteredPodList, m.GetOrphanedPods(podList.Items)...)
+	filteredPodList = append(filteredPodList, podsByOwner[NoOwner]...)
 
 	upgradeStateLabel := GetUpgradeStateLabelKey()
 
 	for i := range filteredPodList {
 		pod := &filteredPodList[i]
 		var ownerDaemonSet *appsv1.DaemonSet
-		if IsOrphanedPod(pod) {
-			ownerDaemonSet = nil
-		} else {
-			ownerDaemonSet = daemonSets[pod.OwnerReferences[0].UID]
+		owner := metav1.GetControllerOfNoCopy(pod)
+		if owner != nil {
+			ownerDaemonSet = daemonSets[owner.UID]
 		}
 		// Check if pod is already scheduled to a Node
 		if pod.Spec.NodeName == "" && pod.Status.Phase == corev1.PodPending {
